@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend/app
+    volumes:
+      - ./backend/app:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env.example
+    depends_on:
+      - redis
+
+  frontend:
+    build: ./frontend
+    volumes:
+      - ./frontend:/app
+    # Ensure dependencies are installed when the container starts (bind-mount hides image node_modules)
+    command: sh -c "npm install --legacy-peer-deps && npm run dev -- --host"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+# Note: in production you'd build assets and serve statically via nginx
