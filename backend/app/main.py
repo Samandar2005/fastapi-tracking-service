@@ -1,9 +1,10 @@
 import os
 import json
 import asyncio
-from typing import Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import aioredis
 
@@ -12,6 +13,16 @@ load_dotenv()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 CHANNEL = "locations"
+API_KEY = os.getenv("API_KEY")  # optional: if set, clients must send X-API-Key header
+
+
+# Pydantic model for incoming location payloads
+class LocationPayload(BaseModel):
+    device_id: str = Field(..., description="Unique device identifier")
+    lat: float = Field(..., description="Latitude in decimal degrees")
+    lng: float = Field(..., description="Longitude in decimal degrees")
+    ts: Optional[int] = Field(None, description="Unix epoch ms (optional)")
+
 
 app = FastAPI(title="fastapi-tracking-service")
 
@@ -86,10 +97,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
 # ---- REST endpoint for publishing ----
 @app.post("/publish")
-async def publish_location(payload: dict):
+async def publish_location(payload: LocationPayload, x_api_key: Optional[str] = Header(None)):
+    # Optional API key check
+    if API_KEY:
+        if not x_api_key or x_api_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+
     try:
         redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-        await redis.publish(CHANNEL, json.dumps(payload))
-        return {"ok": True, "data": payload}
+        data = payload.dict()
+        # set ts if missing
+        if data.get("ts") is None:
+            data["ts"] = int(asyncio.get_event_loop().time() * 1000)
+        await redis.publish(CHANNEL, json.dumps(data))
+        return {"ok": True, "data": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}

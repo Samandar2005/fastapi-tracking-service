@@ -1,8 +1,15 @@
 import React, { useEffect, useState, useRef } from 'react'
 import MapView from './MapView'
 
-// 🔧 WebSocket URL (localhost uchun)
-const WS_URL = (clientId) => `ws://localhost:8000/ws/${clientId}`
+// Determine backend URL dynamically so devices/browsers don't try to use `localhost`.
+// You can override by setting VITE_BACKEND_URL in the frontend environment (example: VITE_BACKEND_URL="http://192.168.1.10:8000")
+const ENV_BACKEND = import.meta.env.VITE_BACKEND_URL
+const BACKEND = ENV_BACKEND || `${window.location.protocol}//${window.location.hostname}:8000`
+const WS_URL = (clientId) => {
+  const wsScheme = BACKEND.startsWith('https') ? 'wss' : 'ws'
+  const host = BACKEND.replace(/^https?:\/\//, '')
+  return `${wsScheme}://${host}/ws/${clientId}`
+}
 
 export default function App() {
   const [messages, setMessages] = useState([])
@@ -51,7 +58,7 @@ export default function App() {
       ts: Date.now(),
     }
 
-    await fetch('http://localhost:8000/publish', {
+    await fetch(`${BACKEND}/publish`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
