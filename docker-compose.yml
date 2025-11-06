@@ -22,11 +22,9 @@ services:
     build: ./frontend
     volumes:
       - ./frontend:/app
-    # Ensure dependencies are installed when the container starts (bind-mount hides image node_modules)
     command: sh -c "npm install --legacy-peer-deps && npm run dev -- --host"
     ports:
       - "5173:5173"
     depends_on:
       - backend
 
-# Note: in production you'd build assets and serve statically via nginx
