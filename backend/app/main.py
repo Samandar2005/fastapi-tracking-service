@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,6 +15,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 CHANNEL = "locations"
 API_KEY = os.getenv("API_KEY")  # optional: if set, clients must send X-API-Key header
 
+# Max history items per device (can be overridden via env)
+MAX_DEVICE_HISTORY = int(os.getenv("MAX_DEVICE_HISTORY", "1000"))
+
 
 # Pydantic model for incoming location payloads
 class LocationPayload(BaseModel):
@@ -22,6 +25,12 @@ class LocationPayload(BaseModel):
     lat: float = Field(..., description="Latitude in decimal degrees")
     lng: float = Field(..., description="Longitude in decimal degrees")
     ts: Optional[int] = Field(None, description="Unix epoch ms (optional)")
+
+
+class LocationHistoryResponse(BaseModel):
+    device_id: str
+    count: int
+    items: List[LocationPayload]
 
 
 app = FastAPI(title="fastapi-tracking-service")
@@ -34,6 +43,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _history_key(device_id: str) -> str:
+    """Redis key for storing per-device history."""
+    return f"device:{device_id}:history"
+
 
 # ---- WebSocket Connection Manager ----
 class ConnectionManager:
@@ -64,6 +79,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+
 # ---- Redis Publisher & Subscriber ----
 async def redis_subscriber():
     """Background task: listen for Redis messages and broadcast to WebSocket clients"""
@@ -77,6 +93,7 @@ async def redis_subscriber():
                 await manager.broadcast(message["data"])
     except Exception as e:
         print("Redis subscriber error:", e)
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -109,7 +126,53 @@ async def publish_location(payload: LocationPayload, x_api_key: Optional[str] = 
         # set ts if missing
         if data.get("ts") is None:
             data["ts"] = int(asyncio.get_event_loop().time() * 1000)
+
+        # Publish to pub/sub channel for real-time updates
         await redis.publish(CHANNEL, json.dumps(data))
+
+        # Store history per device (newest first)
+        key = _history_key(data["device_id"])
+        await redis.lpush(key, json.dumps(data))
+        # Keep only last MAX_DEVICE_HISTORY items
+        await redis.ltrim(key, 0, MAX_DEVICE_HISTORY - 1)
+
         return {"ok": True, "data": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ---- REST endpoint for history ----
+@app.get("/history/{device_id}", response_model=LocationHistoryResponse)
+async def get_history(device_id: str, limit: int = 100):
+    """
+    Return last `limit` points for given device_id from Redis LIST.
+
+    Items are returned from newest to oldest (ts descending).
+    """
+    # Safety on limit value
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    if limit > MAX_DEVICE_HISTORY:
+        limit = MAX_DEVICE_HISTORY
+
+    try:
+        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        key = _history_key(device_id)
+        # lrange 0..limit-1 => newest first (we use LPUSH)
+        raw_items = await redis.lrange(key, 0, limit - 1)
+        items: List[LocationPayload] = []
+        for raw in raw_items:
+            try:
+                payload_dict = json.loads(raw)
+                items.append(LocationPayload(**payload_dict))
+            except Exception:
+                # Skip malformed entries
+                continue
+
+        return LocationHistoryResponse(
+            device_id=device_id,
+            count=len(items),
+            items=items,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
