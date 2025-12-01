@@ -1,20 +1,26 @@
-import os
 import json
 import asyncio
+import logging
+import time
 from typing import Dict, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import aioredis
 
+from .settings import get_settings
+
 load_dotenv()
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-CHANNEL = "locations"
-API_KEY = os.getenv("API_KEY")  
+settings = get_settings()
 
-MAX_DEVICE_HISTORY = int(os.getenv("MAX_DEVICE_HISTORY", "1000"))
+logger = logging.getLogger("tracking-service")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
 
 
 class LocationPayload(BaseModel):
@@ -63,7 +69,7 @@ class LocationHistoryResponse(BaseModel):
     items: List[LocationPayload]
 
 
-app = FastAPI(title="fastapi-tracking-service")
+app = FastAPI(title=settings.APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,12 +92,12 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         self.active_connections[client_id] = websocket
-        print(f"✅ {client_id} connected")
+        logger.info("ws_client_registered", extra={"client_id": client_id})
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
             del self.active_connections[client_id]
-            print(f"❌ {client_id} disconnected")
+            logger.info("ws_client_unregistered", extra={"client_id": client_id})
 
     async def broadcast(self, message: str):
         """Send message to all active connections"""
@@ -111,15 +117,18 @@ manager = ConnectionManager()
 async def redis_subscriber():
     """Background task: listen for Redis messages and broadcast to WebSocket clients"""
     try:
-        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis = aioredis.from_url(str(settings.REDIS_URL), decode_responses=True)
         pubsub = redis.pubsub()
-        await pubsub.subscribe(CHANNEL)
-        print("📡 Subscribed to Redis channel:", CHANNEL)
+        await pubsub.subscribe(settings.REDIS_CHANNEL)
+        logger.info(
+            "redis_subscribe_started",
+            extra={"channel": settings.REDIS_CHANNEL, "redis_url": str(settings.REDIS_URL)},
+        )
         async for message in pubsub.listen():
             if message["type"] == "message":
                 await manager.broadcast(message["data"])
     except Exception as e:
-        print("Redis subscriber error:", e)
+        logger.exception("redis_subscriber_error", extra={"error": str(e)})
 
 
 @app.on_event("startup")
@@ -130,34 +139,58 @@ async def on_startup():
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await manager.connect(websocket, client_id)
+    logger.info("ws_connected", extra={"client_id": client_id})
     try:
         while True:
             data = await websocket.receive_text()
             await manager.broadcast(data)  # optional local echo
     except WebSocketDisconnect:
         manager.disconnect(client_id)
+        logger.info("ws_disconnected", extra={"client_id": client_id})
 
 
 @app.post("/publish")
-async def publish_location(payload: LocationPayload, x_api_key: Optional[str] = Header(None)):
-    if API_KEY:
-        if not x_api_key or x_api_key != API_KEY:
+async def publish_location(
+    request: Request,
+    payload: LocationPayload,
+    x_api_key: Optional[str] = Header(None),
+):
+    if settings.API_KEY:
+        if not x_api_key or x_api_key != settings.API_KEY:
             raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
 
     try:
-        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis = aioredis.from_url(str(settings.REDIS_URL), decode_responses=True)
         data = payload.dict()
         if data.get("ts") is None:
-            data["ts"] = int(asyncio.get_event_loop().time() * 1000)
+            # Use UNIX epoch milliseconds for ts when not provided
+            data["ts"] = int(time.time() * 1000)
 
-        await redis.publish(CHANNEL, json.dumps(data))
+        await redis.publish(settings.REDIS_CHANNEL, json.dumps(data))
 
         key = _history_key(data["device_id"])
         await redis.lpush(key, json.dumps(data))
-        await redis.ltrim(key, 0, MAX_DEVICE_HISTORY - 1)
+        await redis.ltrim(key, 0, settings.MAX_DEVICE_HISTORY - 1)
+
+        client_host = request.client.host if request.client else None
+        logger.info(
+            "location_published",
+            extra={
+                "device_id": data.get("device_id"),
+                "lat": data.get("lat"),
+                "lng": data.get("lng"),
+                "ts": data.get("ts"),
+                "speed": data.get("speed"),
+                "heading": data.get("heading"),
+                "accuracy": data.get("accuracy"),
+                "battery": data.get("battery"),
+                "client_ip": client_host,
+            },
+        )
 
         return {"ok": True, "data": data}
     except Exception as e:
+        logger.exception("location_publish_error", extra={"error": str(e)})
         return {"ok": False, "error": str(e)}
 
 
@@ -170,11 +203,11 @@ async def get_history(device_id: str, limit: int = 100):
     """
     if limit <= 0:
         raise HTTPException(status_code=400, detail="limit must be positive")
-    if limit > MAX_DEVICE_HISTORY:
-        limit = MAX_DEVICE_HISTORY
+    if limit > settings.MAX_DEVICE_HISTORY:
+        limit = settings.MAX_DEVICE_HISTORY
 
     try:
-        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis = aioredis.from_url(str(settings.REDIS_URL), decode_responses=True)
         key = _history_key(device_id)
         raw_items = await redis.lrange(key, 0, limit - 1)
         items: List[LocationPayload] = []
@@ -185,10 +218,47 @@ async def get_history(device_id: str, limit: int = 100):
             except Exception:
                 continue
 
-        return LocationHistoryResponse(
+        response = LocationHistoryResponse(
             device_id=device_id,
             count=len(items),
             items=items,
         )
+        logger.info(
+            "history_fetched",
+            extra={
+                "device_id": device_id,
+                "count": len(items),
+                "limit": limit,
+            },
+        )
+        return response
     except Exception as e:
+        logger.exception("history_fetch_error", extra={"device_id": device_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health() -> Dict[str, object]:
+    """
+    Simple health-check endpoint.
+
+    Returns Redis connectivity and websocket client count.
+    """
+    redis_status = "unknown"
+    try:
+        redis = aioredis.from_url(str(settings.REDIS_URL), decode_responses=True)
+        pong = await redis.ping()
+        redis_status = "ok" if pong else "down"
+    except Exception as e:
+        redis_status = f"error: {e}"
+
+    ws_clients = len(manager.active_connections)
+
+    status = {
+        "redis": redis_status,
+        "websocket_clients": ws_clients,
+        "app_name": settings.APP_NAME,
+    }
+
+    logger.info("health_checked", extra=status)
+    return status
