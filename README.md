@@ -1,5 +1,10 @@
 # fastapi-tracking-service
 
+## Overview in English
+
+A GPS tracking demo with FastAPI, WebSockets, Redis, and a React and Leaflet map.
+
+
 FastAPI Tracking Service — oddiy, konteynerizatsiyalangan loyiha bo'lib, real vaqtda GPS ma'lumotlarini qabul qilish, saqlash va veb interfeys orqali xaritada ko'rsatishni ta'minlaydi.
 
 Ushbu repo quyidagi xizmatlardan iborat:
